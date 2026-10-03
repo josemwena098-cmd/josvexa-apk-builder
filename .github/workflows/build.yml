@@ -1,0 +1,66 @@
+name: Build APK
+run-name: build ${{ inputs.id }}
+on:
+  workflow_dispatch:
+    inputs:
+      id: { required: true, type: string }
+      url: { required: true, type: string }
+      name: { required: true, type: string }
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.7" }
+      - name: Generate project
+        env:
+          APP_ID: ${{ inputs.id }}
+          APP_URL: ${{ inputs.url }}
+          APP_NAME: ${{ inputs.name }}
+        run: |
+          sudo apt-get install -y imagemagick >/dev/null
+          python3 - <<'PY'
+          import os, re, json, html
+          i=re.sub(r'[^a-z0-9]','',os.environ['APP_ID'].lower()) or 'app'
+          pkg='com.josvexa.w'+i
+          url=os.environ['APP_URL']; name=os.environ['APP_NAME']
+          def w(p,c):
+              os.makedirs(os.path.dirname(p) or '.',exist_ok=True); open(p,'w').write(c)
+          w('apk/settings.gradle','pluginManagement{repositories{google();mavenCentral();gradlePluginPortal()}}\ndependencyResolutionManagement{repositories{google();mavenCentral()}}\ninclude ":app"\n')
+          w('apk/build.gradle','plugins{id "com.android.application" version "8.5.2" apply false}\n')
+          w('apk/gradle.properties','android.useAndroidX=true\norg.gradle.jvmargs=-Xmx2g\n')
+          w('apk/app/build.gradle','plugins{id "com.android.application"}\nandroid{namespace "%s"\ncompileSdk 34\ndefaultConfig{applicationId "%s"\nminSdk 21\ntargetSdk 34\nversionCode 1\nversionName "1.0"}\nbuildTypes{release{signingConfig signingConfigs.debug\nminifyEnabled false}}}\n'%(pkg,pkg))
+          w('apk/app/src/main/AndroidManifest.xml','<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n<uses-permission android:name="android.permission.INTERNET"/>\n<application android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:usesCleartextTraffic="true" android:theme="@android:style/Theme.Material.Light.NoActionBar">\n<activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden">\n<intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>\n</activity>\n</application>\n</manifest>\n')
+          w('apk/app/src/main/res/values/strings.xml','<resources><string name="app_name">%s</string></resources>\n'%html.escape(name).replace("'","\\'"))
+          w('apk/app/src/main/java/%s/MainActivity.java'%pkg.replace('.','/'),'''package %s;
+          import android.app.Activity;import android.os.Bundle;import android.webkit.*;import android.content.Intent;import android.net.Uri;
+          public class MainActivity extends Activity{WebView v;
+          @Override protected void onCreate(Bundle b){super.onCreate(b);v=new WebView(this);WebSettings s=v.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setLoadWithOverviewMode(true);s.setUseWideViewPort(true);
+          v.setWebViewClient(new WebViewClient(){@Override public boolean shouldOverrideUrlLoading(WebView w,WebResourceRequest r){String u=r.getUrl().toString();if(u.startsWith("http"))return false;try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(u)));}catch(Exception e){}return true;}});
+          v.setWebChromeClient(new WebChromeClient());setContentView(v);v.loadUrl(%s);}
+          @Override public void onBackPressed(){if(v.canGoBack())v.goBack();else super.onBackPressed();}}
+          '''%(pkg,json.dumps(url)))
+          PY
+          ICON="builds/${APP_ID}/icon.png"
+          for d in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            n=${d%%:*}; s=${d##*:}; mkdir -p apk/app/src/main/res/mipmap-$n
+            convert "$ICON" -resize ${s}x${s}^ -gravity center -extent ${s}x${s} apk/app/src/main/res/mipmap-$n/ic_launcher.png
+          done
+      - name: Build
+        working-directory: apk
+        run: gradle assembleRelease --no-daemon -q
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_ID: ${{ inputs.id }}
+          APP_NAME: ${{ inputs.name }}
+        run: |
+          F="$(echo "$APP_NAME" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//;s/-*$//')"; F="${F:-app}.apk"
+          cp apk/app/build/outputs/apk/release/app-release.apk "$F"
+          gh release create "build-$APP_ID" "$F" --title "$APP_NAME" --notes "$APP_NAME"
